@@ -1,6 +1,8 @@
 name: build-release
 on:
   push:
+    tags:
+      - "v*"
   
 
 permissions:
@@ -34,6 +36,17 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.22"
+      
+      - name: Set tag name
+        id: set_tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+          else
+            TAG="nightly-$(date +'%Y%m%d-%H%M%S')"
+          fi
+          echo "tag_name=${TAG}" >> $GITHUB_OUTPUT
+          echo "Using tag: ${TAG}"
 
       # No download step needed — stdlib only, go build is self-contained
 
@@ -79,4 +92,5 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.set_tag.outputs.tag_name }}
           files: dist/*
