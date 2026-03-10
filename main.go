@@ -103,12 +103,12 @@ func main() {
 
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Jar: jar, Timeout: 30 * time.Second}
-	baseURL := "http://172.21.64.1:8000"
+	baseURL := "https://api.printobd.com"
 
 	// ── Login ──────────────────────────────────
 	loginData, _ := json.Marshal(map[string]string{
 		"username": "hxn",
-		"password": "password",
+		"password": "brimjett",
 	})
 	resp, err := client.Post(baseURL+"/api/accounts/auth/login/", "application/json", bytes.NewBuffer(loginData))
 	if err != nil || resp.StatusCode != 200 {
