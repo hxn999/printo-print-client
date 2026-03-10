@@ -10,6 +10,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.set_tag.outputs.tag_name }}
     strategy:
       matrix:
         include:
@@ -91,5 +93,5 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.set_tag.outputs.tag_name }}
+          tag_name: ${{ needs.build.outputs.tag_name }}
           files: dist/*
