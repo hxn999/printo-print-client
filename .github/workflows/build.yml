@@ -49,9 +49,7 @@ jobs:
           echo "tag_name=${TAG}" >> $GITHUB_OUTPUT
           echo "Using tag: ${TAG}"
 
-      # No download step needed — stdlib only, go build is self-contained
-
-      - name: Build binary
+      - name: Build client
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -59,14 +57,27 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          go build -ldflags "-X main.version=${{ github.ref_name }}" \
-            -o "dist/printer-client-${{ github.ref_name }}-${{ matrix.name }}"
+          go build \
+            -ldflags "-X main.version=${{ github.ref_name }}" \
+            -o "dist/printo-client-${{ github.ref_name }}-${{ matrix.name }}" \
+            ./client
 
-      - name: Generate checksum
+      - name: Build updater
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          go build \
+            -ldflags "-X main.version=${{ github.ref_name }}" \
+            -o "dist/printo-updater-${{ github.ref_name }}-${{ matrix.name }}" \
+            ./updater
+
+      - name: Generate per-arch checksum
         run: |
           cd dist
-          sha256sum "printer-client-${{ github.ref_name }}-${{ matrix.name }}" \
-            > "checksums-${{ matrix.name }}.txt"
+          sha256sum * > "checksums-${{ matrix.name }}.txt"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
