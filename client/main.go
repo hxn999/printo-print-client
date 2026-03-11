@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
@@ -16,8 +17,11 @@ import (
 	"time"
 )
 
+// Injected at build time by -ldflags "-X main.version=vX.Y.Z"
+var version = "dev"
+
 // ─────────────────────────────────────────────
-// Models (mirrors Django Print / PrintOrder)
+// Models
 // ─────────────────────────────────────────────
 
 type Print struct {
@@ -25,11 +29,11 @@ type Print struct {
 	Name                  string `json:"name"`
 	FileURL               string `json:"file_url"`
 	Copies                int    `json:"copies"`
-	Sides                 string `json:"sides"`           // SINGLE_SIDED | DOUBLE_SIDED
-	PrintColor            string `json:"print_color"`     // B_W | COLOR
-	PrintPages            string `json:"print_pages"`     // ALL | CUSTOM
+	Sides                 string `json:"sides"`
+	PrintColor            string `json:"print_color"`
+	PrintPages            string `json:"print_pages"`
 	PageRange             string `json:"page_range"`
-	PagesPerSlide         int    `json:"pages_per_slide"` // 1 | 2 | 4 | 8 | 16
+	PagesPerSlide         int    `json:"pages_per_slide"`
 	TotalPages            int    `json:"total_pages"`
 	RemainingPrintOptions int    `json:"remaining_printing_options"`
 	Cost                  int    `json:"cost"`
@@ -44,7 +48,7 @@ type Order struct {
 }
 
 // ─────────────────────────────────────────────
-// In-memory state (all access guarded by mu)
+// In-memory state
 // ─────────────────────────────────────────────
 
 type PrintJobTrack struct {
@@ -56,26 +60,19 @@ type PrintJobTrack struct {
 }
 
 type AppState struct {
-	mu sync.Mutex
-
-	// Print IDs already submitted to CUPS (keyed by print.ID)
+	mu              sync.Mutex
 	submittedPrints map[int]bool
-
-	// CUPS job ID → tracking info
-	activeJobs map[int]*PrintJobTrack
-
-	// Order ID → set of PrintIDs still waiting on CUPS
-	orderPending map[int]map[int]bool
-
-	// Order IDs already marked PRINTED on the server
+	activeJobs      map[int]*PrintJobTrack
+	orderPending    map[int]map[int]bool
 	completedOrders map[int]bool
 
-	// Local cache directory for downloaded files
-	cacheDir string
+	// orderPrints tracks which file paths belong to which order,
+	// so we can delete them from cache once the order is PRINTED.
+	orderPrints map[int][]string // orderID → []filePath
 
-	// HTTP client (shared, thread-safe)
-	client  *http.Client
-	baseURL string
+	cacheDir string
+	client   *http.Client
+	baseURL  string
 }
 
 func NewAppState(client *http.Client, baseURL, cacheDir string) *AppState {
@@ -84,6 +81,7 @@ func NewAppState(client *http.Client, baseURL, cacheDir string) *AppState {
 		activeJobs:      make(map[int]*PrintJobTrack),
 		orderPending:    make(map[int]map[int]bool),
 		completedOrders: make(map[int]bool),
+		orderPrints:     make(map[int][]string),
 		cacheDir:        cacheDir,
 		client:          client,
 		baseURL:         baseURL,
@@ -91,13 +89,59 @@ func NewAppState(client *http.Client, baseURL, cacheDir string) *AppState {
 }
 
 // ─────────────────────────────────────────────
+// Logger (stdout + /var/log/printo/client.log)
+// — if run standalone (not via updater), it
+//   initialises its own log file.
+// ─────────────────────────────────────────────
+
+const (
+	logDir      = "/var/log/printo"
+	logFile     = logDir + "/client.log"
+	maxLogBytes = 5 * 1024 * 1024 // 5 MB
+)
+
+var logger *log.Logger
+
+func initLogger() {
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		logger = log.New(os.Stdout, "", 0)
+		return
+	}
+
+	rotateIfNeeded(logFile)
+
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		logger = log.New(os.Stdout, "", 0)
+		return
+	}
+
+	logger = log.New(io.MultiWriter(os.Stdout, f), "", 0)
+}
+
+func rotateIfNeeded(path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < maxLogBytes {
+		return
+	}
+	_ = os.Rename(path, path+".1")
+}
+
+func logf(format string, args ...interface{}) {
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	logger.Printf("[client "+ts+"] "+format, args...)
+}
+
+// ─────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────
 
 func main() {
+	initLogger()
+
 	cacheDir := filepath.Join(os.Getenv("HOME"), ".print_cache")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		fmt.Fprintln(os.Stderr, "Cannot create cache dir:", err)
+		logf("FATAL: cannot create cache dir: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -105,22 +149,22 @@ func main() {
 	client := &http.Client{Jar: jar, Timeout: 30 * time.Second}
 	baseURL := "https://api.printobd.com"
 
-	// ── Login ──────────────────────────────────
 	loginData, _ := json.Marshal(map[string]string{
 		"username": "hxn",
 		"password": "brimjett",
 	})
 	resp, err := client.Post(baseURL+"/api/accounts/auth/login/", "application/json", bytes.NewBuffer(loginData))
 	if err != nil || resp.StatusCode != 200 {
-		fmt.Fprintln(os.Stderr, "Login failed:", err)
+		logf("FATAL: login failed: %v\n", err)
 		os.Exit(1)
 	}
 	resp.Body.Close()
-	fmt.Printf("✓ Logged in\n✓ Cache dir: %s\n✓ Polling every 10 s...\n\n", cacheDir)
+
+	logf("logged in — version=%s cache=%s log=%s\n", version, cacheDir, logFile)
+	logf("polling every 10s...\n\n")
 
 	state := NewAppState(client, baseURL, cacheDir)
 
-	// Run immediately, then every 10 s
 	runCycle(state)
 	for range time.NewTicker(10 * time.Second).C {
 		runCycle(state)
@@ -133,15 +177,13 @@ func main() {
 
 func runCycle(s *AppState) {
 	ts := time.Now().Format("15:04:05")
-	fmt.Printf("── %s ──────────────────────────────\n", ts)
+	logf("── %s ──────────────────────────────\n", ts)
 
-	// Step 1: check existing CUPS jobs → possibly mark orders PRINTED
 	checkCupsJobs(s)
 
-	// Step 2: fetch orders from server
 	resp, err := s.client.Get(s.baseURL + "/api/prints/orders/my_orders/")
 	if err != nil {
-		fmt.Println("  Fetch error:", err)
+		logf("fetch error: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -149,10 +191,10 @@ func runCycle(s *AppState) {
 	body, _ := io.ReadAll(resp.Body)
 	var orders []Order
 	if err := json.Unmarshal(body, &orders); err != nil {
-		fmt.Println("  JSON error:", err)
+		logf("JSON error: %v\n", err)
 		return
 	}
-	fmt.Printf("  %d order(s) received\n", len(orders))
+	logf("%d order(s) received\n", len(orders))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -170,23 +212,20 @@ func runCycle(s *AppState) {
 				continue
 			}
 
-			// Download (cached)
 			filePath, err := ensureDownloaded(p, s.cacheDir)
 			if err != nil {
-				fmt.Printf("  [Order %d] ✗ Download '%s': %v\n", order.ID, p.Name, err)
+				logf("[Order %d] ✗ download '%s': %v\n", order.ID, p.Name, err)
 				continue
 			}
 
-			// Submit to CUPS
 			cupsJobID, err := submitToCups(p, filePath)
 			if err != nil {
-				fmt.Printf("  [Order %d] ✗ CUPS '%s': %v\n", order.ID, p.Name, err)
+				logf("[Order %d] ✗ CUPS '%s': %v\n", order.ID, p.Name, err)
 				continue
 			}
 
-			fmt.Printf("  [Order %d] ✓ '%s' → CUPS job #%d\n", order.ID, p.Name, cupsJobID)
+			logf("[Order %d] ✓ '%s' → CUPS job #%d\n", order.ID, p.Name, cupsJobID)
 
-			// Track state
 			s.submittedPrints[p.ID] = true
 			s.activeJobs[cupsJobID] = &PrintJobTrack{
 				CupsJobID: cupsJobID,
@@ -197,6 +236,9 @@ func runCycle(s *AppState) {
 				s.orderPending[order.ID] = make(map[int]bool)
 			}
 			s.orderPending[order.ID][p.ID] = true
+
+			// Record the file path for later cache cleanup.
+			s.orderPrints[order.ID] = append(s.orderPrints[order.ID], filePath)
 		}
 	}
 }
@@ -206,16 +248,15 @@ func runCycle(s *AppState) {
 // ─────────────────────────────────────────────
 
 func ensureDownloaded(p Print, cacheDir string) (string, error) {
-	// Unique filename: <printID>_<sanitized original name>
 	filename := fmt.Sprintf("%d_%s", p.ID, sanitize(p.Name))
 	filePath := filepath.Join(cacheDir, filename)
 
 	if _, err := os.Stat(filePath); err == nil {
-		fmt.Printf("    → cache hit: %s\n", filename)
+		logf("  cache hit: %s\n", filename)
 		return filePath, nil
 	}
 
-	fmt.Printf("    → downloading: %s\n", p.Name)
+	logf("  downloading: %s\n", p.Name)
 
 	resp, err := http.Get(p.FileURL)
 	if err != nil {
@@ -223,7 +264,6 @@ func ensureDownloaded(p Print, cacheDir string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	// Write to .tmp then rename (atomic)
 	tmp := filePath + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -239,16 +279,12 @@ func ensureDownloaded(p Print, cacheDir string) (string, error) {
 }
 
 // ─────────────────────────────────────────────
-// CUPS submission via lp
+// CUPS submission
 // ─────────────────────────────────────────────
 
 func submitToCups(p Print, filePath string) (int, error) {
-	// args := []string{"-d", "default"}
+	args := []string{"-n", strconv.Itoa(max1(p.Copies))}
 
-	// ── Copies ────────────────────────────────
-	args := []string{ "-n", strconv.Itoa(max1(p.Copies))}
-
-	// ── Sides ─────────────────────────────────
 	switch p.Sides {
 	case "DOUBLE_SIDED":
 		args = append(args, "-o", "sides=two-sided-long-edge")
@@ -256,7 +292,6 @@ func submitToCups(p Print, filePath string) (int, error) {
 		args = append(args, "-o", "sides=one-sided")
 	}
 
-	// ── Color ─────────────────────────────────
 	switch p.PrintColor {
 	case "COLOR":
 		args = append(args, "-o", "print-color-mode=color")
@@ -264,21 +299,16 @@ func submitToCups(p Print, filePath string) (int, error) {
 		args = append(args, "-o", "print-color-mode=monochrome")
 	}
 
-	// ── Page range ────────────────────────────
 	if p.PrintPages == "CUSTOM" && strings.TrimSpace(p.PageRange) != "" {
 		args = append(args, "-o", "page-ranges="+strings.TrimSpace(p.PageRange))
 	}
 
-	// ── N-up (pages per slide) ────────────────
 	if p.PagesPerSlide > 1 {
 		args = append(args, "-o", fmt.Sprintf("number-up=%d", p.PagesPerSlide))
-		// Natural reading order
 		args = append(args, "-o", "number-up-layout=lrtb")
 	}
 
-	// ── Job title ─────────────────────────────
 	args = append(args, "-t", fmt.Sprintf("[PrintID-%d] %s", p.ID, p.Name))
-
 	args = append(args, filePath)
 
 	out, err := exec.Command("lp", args...).CombinedOutput()
@@ -293,7 +323,6 @@ func submitToCups(p Print, filePath string) (int, error) {
 	return jobID, nil
 }
 
-// "request id is <printer>-42 (1 file(s))"
 func parseCupsJobID(output string) int {
 	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)
@@ -335,21 +364,19 @@ func checkCupsJobs(s *AppState) {
 
 		switch {
 		case completed[cupsID]:
-			fmt.Printf("  ✓ CUPS #%d done    (print ID %d, order %d)\n", cupsID, job.PrintID, job.OrderID)
+			logf("✓ CUPS #%d done    (print ID %d, order %d)\n", cupsID, job.PrintID, job.OrderID)
 			job.Done, job.Success = true, true
 			delete(s.orderPending[job.OrderID], job.PrintID)
 			readyOrders[job.OrderID] = true
 
 		case failed[cupsID]:
-			fmt.Printf("  ✗ CUPS #%d FAILED  (print ID %d, order %d)\n", cupsID, job.PrintID, job.OrderID)
+			logf("✗ CUPS #%d FAILED  (print ID %d, order %d)\n", cupsID, job.PrintID, job.OrderID)
 			job.Done, job.Success = true, false
-			// Remove so we don't block the order indefinitely
 			delete(s.orderPending[job.OrderID], job.PrintID)
 			readyOrders[job.OrderID] = true
 		}
 	}
 
-	// Fire bulk_update_status for orders where every print is resolved
 	for orderID := range readyOrders {
 		if pending, ok := s.orderPending[orderID]; ok && len(pending) == 0 {
 			go markOrderPrinted(s, orderID)
@@ -357,7 +384,6 @@ func checkCupsJobs(s *AppState) {
 	}
 }
 
-// lpstat -W completed  →  lines: "printer-42  user  size  date  title"
 func cupsCompletedJobIDs() map[int]bool {
 	ids := map[int]bool{}
 	out, err := exec.Command("lpstat", "-W", "completed").CombinedOutput()
@@ -372,7 +398,6 @@ func cupsCompletedJobIDs() map[int]bool {
 	return ids
 }
 
-// Aborted / canceled jobs come back in lpstat without a -W flag (active queue)
 func cupsFailedJobIDs() map[int]bool {
 	ids := map[int]bool{}
 	out, err := exec.Command("lpstat").CombinedOutput()
@@ -395,7 +420,7 @@ func jobIDFromLpstatLine(line string) int {
 	if len(fields) == 0 {
 		return 0
 	}
-	token := fields[0] // e.g. "HP_LaserJet-42"
+	token := fields[0]
 	if idx := strings.LastIndex(token, "-"); idx >= 0 {
 		if id, err := strconv.Atoi(token[idx+1:]); err == nil {
 			return id
@@ -405,7 +430,7 @@ func jobIDFromLpstatLine(line string) int {
 }
 
 // ─────────────────────────────────────────────
-// Bulk status update  POST /api/prints/print-orders/bulk_update_status/
+// Mark order PRINTED + delete cache files
 // ─────────────────────────────────────────────
 
 func markOrderPrinted(s *AppState, orderID int) {
@@ -420,19 +445,37 @@ func markOrderPrinted(s *AppState, orderID int) {
 		bytes.NewBuffer(payload),
 	)
 	if err != nil {
-		fmt.Printf("  [Order %d] bulk_update_status error: %v\n", orderID, err)
+		logf("[Order %d] bulk_update_status error: %v\n", orderID, err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 200 || resp.StatusCode == 204 {
-		fmt.Printf("  [Order %d] ✓ marked PRINTED on server\n", orderID)
+		logf("[Order %d] ✓ marked PRINTED on server\n", orderID)
+
 		s.mu.Lock()
 		s.completedOrders[orderID] = true
+		filePaths := s.orderPrints[orderID]
+		delete(s.orderPrints, orderID)
 		s.mu.Unlock()
+
+		// Delete cached files now that the order is confirmed PRINTED.
+		deleteCacheFiles(orderID, filePaths)
 	} else {
 		b, _ := io.ReadAll(resp.Body)
-		fmt.Printf("  [Order %d] bulk_update_status HTTP %d: %s\n", orderID, resp.StatusCode, string(b))
+		logf("[Order %d] bulk_update_status HTTP %d: %s\n", orderID, resp.StatusCode, string(b))
+	}
+}
+
+func deleteCacheFiles(orderID int, paths []string) {
+	for _, p := range paths {
+		if err := os.Remove(p); err != nil {
+			if !os.IsNotExist(err) {
+				logf("[Order %d] ✗ delete cache '%s': %v\n", orderID, p, err)
+			}
+		} else {
+			logf("[Order %d] ✓ deleted cache: %s\n", orderID, filepath.Base(p))
+		}
 	}
 }
 

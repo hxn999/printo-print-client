@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -23,8 +24,12 @@ const (
 	githubRepo   = "hxn999/printo-print-client"
 	installDir   = "/opt/printo"
 	versionsDir  = installDir + "/versions"
-	currentLink  = installDir + "/current"          // symlink → versionsDir/vX.Y.Z
-	clientBin    = currentLink + "/printo-client"   // resolved via symlink
+	currentLink  = installDir + "/current"        // symlink → versionsDir/vX.Y.Z
+	clientBin    = currentLink + "/printo-client" // resolved via symlink
+	logDir       = "/var/log/printo"
+	updaterLog   = logDir + "/updater.log"
+	clientLog    = logDir + "/client.log"
+	maxLogBytes  = 5 * 1024 * 1024 // rotate at 5 MB
 	pollInterval = 30 * time.Minute
 	httpTimeout  = 60 * time.Second
 )
@@ -41,23 +46,64 @@ type Asset struct {
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
 
+// ── Logger ────────────────────────────────────────────────────────────────────
+
+var logger *log.Logger
+
+func initLogger() {
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot create log dir %s: %v — logging to stdout only\n", logDir, err)
+		logger = log.New(os.Stdout, "", 0)
+		return
+	}
+
+	rotateIfNeeded(updaterLog)
+
+	f, err := os.OpenFile(updaterLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot open log file: %v — logging to stdout only\n", err)
+		logger = log.New(os.Stdout, "", 0)
+		return
+	}
+
+	logger = log.New(io.MultiWriter(os.Stdout, f), "", 0)
+}
+
+func rotateIfNeeded(path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < maxLogBytes {
+		return
+	}
+	_ = os.Rename(path, path+".1")
+}
+
+func logf(format string, args ...interface{}) {
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	logger.Printf("[updater "+ts+"] "+format, args...)
+}
+
+func fatalf(format string, args ...interface{}) {
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	logger.Printf("[updater "+ts+"] FATAL: "+format, args...)
+	os.Exit(1)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 func main() {
+	initLogger()
+
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
 		fatalf("GITHUB_TOKEN env var is required\n")
 	}
 
 	arch := archSuffix()
-	fmt.Printf("printo-updater %s  arch=%s\n", version, arch)
-	fmt.Printf("poll interval: %s\n\n", pollInterval)
+	logf("starting — version=%s arch=%s poll=%s\n", version, arch, pollInterval)
+	logf("updater log: %s\n", updaterLog)
+	logf("client  log: %s\n\n", clientLog)
 
-	// Track the running client PID so we can restart it after an update.
-	var clientPID int
-
-	// Start client for the first time.
-	clientPID = startClient()
+	clientPID := startClient()
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -81,12 +127,10 @@ func main() {
 			continue
 		}
 
-		// Update succeeded — restart client with new binary.
 		logf("restarting client...\n")
 		stopProcess(clientPID)
 		clientPID = startClient()
 
-		// Re-exec updater itself so it runs the new version next poll.
 		logf("re-executing updater as %s\n", latest.TagName)
 		reExecUpdater(latest.TagName)
 	}
@@ -94,14 +138,13 @@ func main() {
 
 // ── Update pipeline ───────────────────────────────────────────────────────────
 
-func applyUpdate(rel Release, arch, token string) error {
+// applyUpdate accepts *Release — consistent with fetchLatestRelease's return type.
+func applyUpdate(rel *Release, arch, token string) error {
 	tag := rel.TagName
 	clientAsset := fmt.Sprintf("printo-client-%s-%s", tag, arch)
 	updaterAsset := fmt.Sprintf("printo-updater-%s-%s", tag, arch)
-	checksumAsset := "checksums.txt"
 
-	// Download checksums first.
-	checksums, err := downloadChecksums(rel.Assets, checksumAsset, token)
+	checksums, err := downloadChecksums(rel.Assets, "checksums.txt", token)
 	if err != nil {
 		return fmt.Errorf("checksums: %w", err)
 	}
@@ -111,19 +154,15 @@ func applyUpdate(rel Release, arch, token string) error {
 		return fmt.Errorf("mkdir %s: %w", versionDir, err)
 	}
 
-	// Download and verify both binaries into versionsDir/tag/.
 	for _, asset := range []string{clientAsset, updaterAsset} {
-		destName := strings.TrimSuffix(strings.TrimSuffix(asset, "-"+arch), "-"+tag)
-		// printo-client-vX-linux-arm64 → printo-client
-		// printo-updater-vX-linux-arm64 → printo-updater
-		parts := strings.SplitN(asset, "-", 3) // ["printo", "client", ...]
-		destName = parts[0] + "-" + parts[1]
-
+		// "printo-client-v1.0.0-linux-arm64" → dest "printo-client"
+		// "printo-updater-v1.0.0-linux-arm64" → dest "printo-updater"
+		parts := strings.SplitN(asset, "-", 3) // ["printo", "client|updater", ...]
+		destName := parts[0] + "-" + parts[1]
 		destPath := filepath.Join(versionDir, destName)
 
 		url := assetURL(rel.Assets, asset)
 		if url == "" {
-			// Clean up on failure.
 			os.RemoveAll(versionDir)
 			return fmt.Errorf("asset not found in release: %s", asset)
 		}
@@ -134,11 +173,10 @@ func applyUpdate(rel Release, arch, token string) error {
 			return fmt.Errorf("download %s: %w", asset, err)
 		}
 
-		// Verify SHA256.
 		expected, ok := checksums[asset]
 		if !ok {
 			os.RemoveAll(versionDir)
-			return fmt.Errorf("no checksum for %s", asset)
+			return fmt.Errorf("no checksum entry for %s", asset)
 		}
 		if err := verifySHA256(destPath, expected); err != nil {
 			os.RemoveAll(versionDir)
@@ -152,8 +190,7 @@ func applyUpdate(rel Release, arch, token string) error {
 		}
 	}
 
-	// Atomically swap the symlink: current → versionsDir/tag
-	// Use a temp symlink + rename to avoid a window where current is broken.
+	// Atomic symlink swap — never leaves currentLink broken.
 	tmpLink := currentLink + ".tmp"
 	os.Remove(tmpLink)
 	if err := os.Symlink(versionDir, tmpLink); err != nil {
@@ -166,16 +203,26 @@ func applyUpdate(rel Release, arch, token string) error {
 		return fmt.Errorf("atomic rename symlink: %w", err)
 	}
 
-	logf("✓ updated to %s (symlink: %s → %s)\n", tag, currentLink, versionDir)
+	logf("✓ updated to %s → %s\n", tag, versionDir)
 	return nil
 }
 
 // ── Client process management ─────────────────────────────────────────────────
 
 func startClient() int {
+	rotateIfNeeded(clientLog)
+
+	f, err := os.OpenFile(clientLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		logf("cannot open client log: %v — using stdout\n", err)
+		f = os.Stdout
+	}
+
+	out := io.MultiWriter(os.Stdout, f)
+
 	cmd := exec.Command(clientBin)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = out
+	cmd.Stderr = out
 
 	if err := cmd.Start(); err != nil {
 		logf("failed to start client: %v\n", err)
@@ -184,8 +231,6 @@ func startClient() int {
 
 	logf("client started (PID %d)\n", cmd.Process.Pid)
 
-	// Don't Wait() here — we want non-blocking. Monitor in background so the
-	// OS doesn't accumulate a zombie process.
 	go func() {
 		if err := cmd.Wait(); err != nil {
 			logf("client exited: %v\n", err)
@@ -203,20 +248,17 @@ func stopProcess(pid int) {
 	if err != nil {
 		return
 	}
-	// SIGTERM first — give client a chance to flush.
+	logf("SIGTERM → PID %d\n", pid)
 	_ = proc.Signal(syscall.SIGTERM)
 	time.Sleep(3 * time.Second)
-	// SIGKILL if still alive.
 	_ = proc.Signal(syscall.SIGKILL)
 }
 
-// reExecUpdater replaces the current updater process with the new binary.
-// This is a one-way operation — control never returns here.
 func reExecUpdater(newVersion string) {
 	newBin := filepath.Join(versionsDir, newVersion, "printo-updater")
 	logf("exec: %s\n", newBin)
 	if err := syscall.Exec(newBin, os.Args, os.Environ()); err != nil {
-		logf("re-exec failed: %v — updater will stay at %s until next restart\n", err, version)
+		logf("re-exec failed: %v — updater stays at %s until service restart\n", err, version)
 	}
 }
 
@@ -229,8 +271,8 @@ func fetchLatestRelease(token string) (*Release, error) {
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-	client := &http.Client{Timeout: httpTimeout}
-	resp, err := client.Do(req)
+	c := &http.Client{Timeout: httpTimeout}
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -253,8 +295,8 @@ func downloadFile(url, dest, token string) error {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/octet-stream")
 
-	client := &http.Client{Timeout: httpTimeout}
-	resp, err := client.Do(req)
+	c := &http.Client{Timeout: httpTimeout}
+	resp, err := c.Do(req)
 	if err != nil {
 		return err
 	}
@@ -301,7 +343,6 @@ func downloadChecksums(assets []Asset, name, token string) (map[string]string, e
 		if line == "" {
 			continue
 		}
-		// sha256sum format: "<hash>  <filename>"
 		parts := strings.Fields(line)
 		if len(parts) == 2 {
 			result[parts[1]] = parts[0]
@@ -340,28 +381,15 @@ func assetURL(assets []Asset, name string) string {
 // ── Arch detection ────────────────────────────────────────────────────────────
 
 func archSuffix() string {
-	os_ := runtime.GOOS
-	arch := runtime.GOARCH
-	switch arch {
+	goos := runtime.GOOS
+	switch runtime.GOARCH {
 	case "arm":
-		return os_ + "-armv7"
+		return goos + "-armv7"
 	case "arm64":
-		return os_ + "-arm64"
+		return goos + "-arm64"
 	case "386":
-		return os_ + "-386"
+		return goos + "-386"
 	default:
-		return os_ + "-amd64"
+		return goos + "-amd64"
 	}
-}
-
-// ── Logging ───────────────────────────────────────────────────────────────────
-
-func logf(format string, args ...interface{}) {
-	ts := time.Now().Format("15:04:05")
-	fmt.Printf("[updater %s] "+format, append([]interface{}{ts}, args...)...)
-}
-
-func fatalf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "FATAL: "+format, args...)
-	os.Exit(1)
 }
